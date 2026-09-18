@@ -20,6 +20,8 @@ Obstoječih project index.html NE prepiše — respektira ročne editacije naslo
 Na koncu: git add -A + commit + push.
 """
 
+from __future__ import annotations  # kompatibilnost s Python 3.7+ (potrebno za "str | None" hint)
+
 import os
 import re
 import shutil
@@ -404,19 +406,33 @@ def list_photos(dir_path: Path):
     photos.sort(key=lambda x: natural_key(x.name))
     return photos
 
-def resize_or_copy(src: Path, dst: Path, max_width: int = RESIZE_MAX_WIDTH):
-    """Če je izvorna > 800KB, resize + recompress. Sicer samo copy."""
+def resize_or_copy(src: Path, dst: Path, max_width: int = RESIZE_MAX_WIDTH, max_retries: int = 4):
+    """Če je izvorna > 800KB, resize + recompress. Sicer samo copy.
+    Ima retry logic za macOS Spotlight/mount deadlock napake."""
+    import time
     size = src.stat().st_size
-    if size > COMPRESS_THRESHOLD:
-        subprocess.run([
-            "sips",
-            "-Z", str(max_width),
-            "-s", "formatOptions", str(JPEG_QUALITY),
-            str(src),
-            "--out", str(dst),
-        ], check=True, capture_output=True)
-    else:
-        shutil.copy2(src, dst)
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            if size > COMPRESS_THRESHOLD:
+                subprocess.run([
+                    "sips",
+                    "-Z", str(max_width),
+                    "-s", "formatOptions", str(JPEG_QUALITY),
+                    str(src),
+                    "--out", str(dst),
+                ], check=True, capture_output=True)
+            else:
+                shutil.copy2(src, dst)
+            # Verify destination has reasonable size
+            if dst.exists() and dst.stat().st_size > 1000:
+                return
+            last_err = "output file empty or missing"
+        except (subprocess.CalledProcessError, OSError) as e:
+            last_err = str(e)
+        # Retry with backoff
+        time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"resize_or_copy failed after {max_retries} tries: {last_err}")
 
 def find_hero_dir(cat_src: Path):
     """HERO ali 'HERO ' (s presledkom)."""
@@ -481,7 +497,7 @@ def process_project(cat_upper: str, cat_slug: str, cat_display: str, project_src
     Obdela en projekt. Vrne (slug, title, photo_count, is_new).
     is_new = True če je HTML na novo generiran; False če je HTML že obstajal.
     """
-    project_name = project_src.name
+    project_name = project_src.name.strip()  # očisti leading/trailing whitespace
     slug = slugify(project_name)
     project_dst = DST / cat_slug / slug
     photos_dst = project_dst / "photos"
@@ -645,7 +661,7 @@ def main():
         # Projekti
         project_dirs = sorted(
             [d for d in cat_src.iterdir() if d.is_dir() and d.name.strip().upper() != "HERO"],
-            key=lambda x: natural_key(x.name)
+            key=lambda x: natural_key(x.name.strip())
         )
         projects_info = []
         for proj_src in project_dirs:
